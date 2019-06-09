@@ -6,7 +6,9 @@ use MadWizard\WebAuthn\Credential\CredentialStoreInterface;
 use MadWizard\WebAuthn\Credential\UserCredentialInterface;
 use MadWizard\WebAuthn\Crypto\CoseKey;
 use MadWizard\WebAuthn\Dom\AuthenticatorSelectionCriteria;
+use MadWizard\WebAuthn\Dom\PublicKeyCredentialDescriptor;
 use MadWizard\WebAuthn\Exception\WebAuthnException;
+use MadWizard\WebAuthn\Extension\UnknownExtensionInput;
 use MadWizard\WebAuthn\Format\ByteBuffer;
 use MadWizard\WebAuthn\Server\Registration\RegistrationOptions;
 use MadWizard\WebAuthn\Server\UserIdentity;
@@ -14,7 +16,7 @@ use MadWizard\WebAuthn\Server\WebAuthnServer;
 
 require __DIR__ . '/../vendor/autoload.php';
 
-session_start();
+
 
 class StatusException extends Exception
 {
@@ -70,25 +72,41 @@ class UserCred implements UserCredentialInterface
         return $this->userHandle;
     }
 }
+
+session_start();
+
 $store = new class implements CredentialStoreInterface {
     public function findCredential(string $credentialId): ?UserCredentialInterface
     {
-        // TODO: Implement findCredential() method.
+        return $_SESSION['credentials'][$credentialId] ?? null;
     }
 
     public function registerCredential(CredentialRegistration $credential)
     {
         // TODO: Implement registerCredential() method.
+
+        $_SESSION['credentials'][$credential->getCredentialId()] =
+            [
+                new UserCred($credential->getCredentialId(), $credential->getPublicKey(), $credential->getUserHandle()),
+                null
+            ];
     }
 
     public function getSignatureCounter(string $credentialId): ?int
     {
-        // TODO: Implement getSignatureCounter() method.
+        return $_SESSION['credentials'][$credentialId][1] ?? null;
     }
 
     public function updateSignatureCounter(string $credentialId, int $counter): void
     {
-        // TODO: Implement updateSignatureCounter() method.
+        $_SESSION['credentials'][$credentialId][1] = $counter;
+    }
+
+    public function getAllFor(ByteBuffer $userHandle) : array
+    {
+        return array_filter($_SESSION['credentials'] ?? [], function ($cred) use ($userHandle) {
+            return $userHandle->equals($cred[0]->getUserHandle());
+        });
     }
 };
 
@@ -98,6 +116,11 @@ $server = new class($store) {
      */
     private $server;
 
+    /**
+     * @var CredentialStoreInterface
+     */
+    private $store;
+
     public function __construct(CredentialStoreInterface $store)
     {
         $config = new WebAuthnConfiguration();
@@ -105,6 +128,7 @@ $server = new class($store) {
         $config->setRelyingPartyId('localhost');
         $config->setRelyingPartyOrigin('http://' . $_SERVER['HTTP_HOST']);
         $this->server = new WebAuthnServer($config, $store);
+        $this->store = $store;
     }
 
     private function getPostJson() : array
@@ -126,7 +150,7 @@ $server = new class($store) {
             if ($url === '/attestation/options') {
                 $response = $this->attestationOptions($this->getPostJson());
             } elseif ($url === '/attestation/result') {
-                $response = $this->attestationResult($this->getPostJson());
+                $response = $this->attestationResult(file_get_contents('php://input'));
             } elseif ($url === '/assertion/options') {
                 $response = $this->assertionOptions($this->getPostJson());
             } elseif ($url === '/assertion/result') {
@@ -166,44 +190,43 @@ $server = new class($store) {
             $crit->setUserVerification($v);
         }
 
+        // TODO!!!!! MOVE TO library?
+
+
+
+
         $att = $req['attestation'] ?? 'none';
 
         $opts = new RegistrationOptions($userIdentity);
+
         $opts->setAttestation($att);
         $opts->setAuthenticatorSelection($crit);
-
+        foreach ($req['extensions'] ?? [] as $identifier => $ext) {
+            $opts->addExtensionInput(new UnknownExtensionInput($identifier, $ext));
+        }
         $regReq = $this->server->startRegistration($opts);
+
+        // TODO- move to lib
+        foreach ($this->store->getAllFor($userIdentity->getUserHandle()) as $c) {
+            /**
+             * @var UserCredentialInterface $c
+             */
+            $regReq->getClientOptions()->addExcludeCredential(
+                new PublicKeyCredentialDescriptor(
+                    ByteBuffer::fromBase64Url($c->getCredentialId())
+                )
+            );
+        }
+
+        $_SESSION['context'] = $regReq->getContext();
         return [200, array_merge(['status' => 'ok', 'errorMessage' => ''], $regReq->getClientOptionsJson())];
     }
 
-    public function attestationResult(array $req) : array
+    public function attestationResult(string $req) : array
     {
-        $userIdentity = new UserIdentity(
-            new ByteBuffer($req['username']),
-            $req['username'],
-            $req['displayName']
-        );
-
-        $sel = $req['authenticatorSelection'] ?? [];
-        $crit = new AuthenticatorSelectionCriteria();
-        if (($v = $sel['authenticatorAttachment'] ?? null) !== null) {
-            $crit->setAuthenticatorAttachment($v);
-        }
-        if (($v = $sel['requireResidentKey'] ?? null) !== null) {
-            $crit->setRequireResidentKey($v);
-        }
-        if (($v = $sel['userVerification'] ?? null) !== null) {
-            $crit->setUserVerification($v);
-        }
-
-        $att = $req['attestation'] ?? 'none';
-
-        $opts = new RegistrationOptions($userIdentity);
-        $opts->setAttestation($att);
-        $opts->setAuthenticatorSelection($crit);
-
-        $regReq = $this->server->startRegistration($opts);
-        return [200, array_merge(['status' => 'ok', 'errorMessage' => ''], $regReq->getClientOptionsJson())];
+        $context = $_SESSION['context'];
+        $this->server->finishRegistration($req, $context);
+        return [200, ['status' => 'ok', 'errorMessage' => '']];
     }
 };
 
